@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Paste Annotate
+Comment=Draw on an image before Ctrl+V pastes it
+Exec=/usr/bin/paste-annotate
+Icon=image-x-generic
+Terminal=false
+Categories=Graphics;Utility;
+StartupNotify=false
