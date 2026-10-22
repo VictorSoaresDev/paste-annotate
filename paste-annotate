@@ -1,0 +1,2032 @@
+#!/usr/bin/env python3
+"""Ctrl+V of an image-only clipboard opens a marker. Text pastes are replayed."""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import ctypes
+import fcntl
+import json
+import math
+import os
+import select
+import signal
+import struct
+import sys
+import time
+import traceback
+from dataclasses import dataclass, field
+from io import BytesIO
+from pathlib import Path
+
+os.environ.setdefault("GDK_BACKEND", "x11")
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
+from PIL import Image, ImageDraw, ImageOps
+
+# Hot path budget. Every plain Ctrl+V waits at most this long for the
+# clipboard's type list, then the key is replayed. Image bytes are read
+# only after the keyboard grab is released.
+TARGETS_BUDGET_S = 0.08
+IMAGE_BUDGET_S = 2.0
+MAX_CLIP_BYTES = 40 * 1024 * 1024
+
+HOME = Path.home()
+STATE_DIR = HOME / ".local/share/paste-annotate"
+LOG_PATH = STATE_DIR / "paste-annotate.log"
+LOCK_PATH = STATE_DIR / "instance.lock"
+PREFS_PATH = HOME / ".config/paste-annotate/prefs.json"
+
+KeyPress = 2
+KeyRelease = 3
+PropertyNotify = 28
+SelectionNotify = 31
+MappingNotify = 34
+ClientMessage = 33
+GrabModeSync = 0
+GrabModeAsync = 1
+ReplayKeyboard = 5
+AsyncKeyboard = 3
+ShiftMask = 1
+LockMask = 2
+ControlMask = 4
+Mod1Mask = 8
+Mod2Mask = 16
+Mod4Mask = 64
+Mod5Mask = 128
+ButtonMask = 0x1F00
+GroupMask = 3 << 13
+PropertyChangeMask = 1 << 22
+SubstructureNotifyMask = 1 << 19
+SubstructureRedirectMask = 1 << 20
+AnyModifier = 1 << 15
+CurrentTime = 0
+RevertToParent = 2
+PropertyNewValue = 0
+
+STRIP_MODS = LockMask | Mod2Mask | ButtonMask | GroupMask
+
+SWATCHES = (
+    ("1", "Red", "#ff2b2b"),
+    ("2", "Orange", "#ff8c1a"),
+    ("3", "Yellow", "#ffd400"),
+    ("4", "Green", "#19c37d"),
+    ("5", "Blue", "#2f80ff"),
+    ("6", "White", "#ffffff"),
+    ("7", "Black", "#161616"),
+)
+IMAGE_MIMES = (
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/bmp",
+    "image/x-bmp",
+    "image/x-MS-bmp",
+    "image/webp",
+    "image/gif",
+    "image/tiff",
+)
+TEXT_NAMES = {
+    "utf8_string",
+    "string",
+    "text",
+    "compound_text",
+    "text/plain",
+    "text/plain;charset=utf-8",
+    "text/unicode",
+}
+
+CSS = b"""
+window.pa { background-color: #2a2a2a; }
+.pa-bar { background-color: #1b1b1b; padding: 6px; }
+.pa-hint { color: #c8c8c8; padding: 2px 10px 8px 10px; }
+button.swatch {
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  margin: 0 2px;
+  border-radius: 3px;
+  border-width: 2px;
+  border-style: solid;
+  border-color: rgba(255,255,255,0.28);
+  background-image: none;
+  box-shadow: none;
+}
+button.swatch.selected { border-color: #ffffff; }
+button.swatch.c0 { background-color: #ff2b2b; }
+button.swatch.c1 { background-color: #ff8c1a; }
+button.swatch.c2 { background-color: #ffd400; }
+button.swatch.c3 { background-color: #19c37d; }
+button.swatch.c4 { background-color: #2f80ff; }
+button.swatch.c5 { background-color: #ffffff; }
+button.swatch.c6 { background-color: #161616; }
+button.tool { padding-left: 10px; padding-right: 10px; }
+"""
+
+
+def log(msg: str) -> None:
+    line = time.strftime("%Y-%m-%d %H:%M:%S") + " " + msg
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > 262144:
+            prev = LOG_PATH.with_suffix(".log.1")
+            prev.unlink(missing_ok=True)
+            LOG_PATH.replace(prev)
+        with LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    if os.environ.get("PASTE_ANNOTATE_DEBUG"):
+        print(line, flush=True)
+
+
+def load_prefs() -> dict:
+    try:
+        data = json.loads(PREFS_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    color = str(data.get("color") or SWATCHES[0][2])
+    try:
+        width = int(data.get("width", 8))
+    except (TypeError, ValueError):
+        width = 8
+    tool = data.get("tool") if data.get("tool") in ("pen", "arrow", "circle") else "pen"
+    return {"color": color, "width": max(2, min(36, width)), "tool": tool}
+
+
+def save_prefs(prefs: dict) -> None:
+    try:
+        PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PREFS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(prefs), encoding="utf-8")
+        tmp.replace(PREFS_PATH)
+    except OSError as exc:
+        log(f"prefs not saved: {exc}")
+
+
+def hex_rgb(value: str) -> tuple[int, int, int]:
+    value = value.strip().lstrip("#")
+    if len(value) != 6:
+        return (255, 43, 43)
+    try:
+        return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+    except ValueError:
+        return (255, 43, 43)
+
+
+def is_text_name(name: str) -> bool:
+    low = name.lower()
+    return low in TEXT_NAMES or low.startswith("text/plain")
+
+
+def is_image_name(name: str) -> bool:
+    low = name.lower()
+    return low.startswith("image/") or low == "application/x-qt-image"
+
+
+def classify_names(names: list[str]) -> str:
+    saw_image = False
+    saw_text = False
+    for name in names:
+        if is_text_name(name):
+            saw_text = True
+        elif is_image_name(name):
+            saw_image = True
+    if saw_image and not saw_text:
+        return "image"
+    return "pass"
+
+
+def choose_mime(names: list[str]) -> str | None:
+    by_low = {name.lower(): name for name in names}
+    for mime in IMAGE_MIMES:
+        if mime.lower() in by_low:
+            return by_low[mime.lower()]
+    for name in names:
+        if name.lower().startswith("image/"):
+            return name
+    return None
+
+
+@dataclass
+class Stroke:
+    tool: str
+    color: tuple[int, int, int]
+    width: float
+    points: list[tuple[float, float]] = field(default_factory=list)
+    box: tuple[float, float, float, float] | None = None
+
+
+def _fill(color: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    return (color[0], color[1], color[2], 255)
+
+
+def _draw_line(draw: ImageDraw.ImageDraw, pts, fill, width: int) -> None:
+    if len(pts) == 1:
+        x, y = pts[0]
+        r = width / 2
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
+        return
+    try:
+        draw.line(pts, fill=fill, width=width, joint="curve")
+    except TypeError:
+        draw.line(pts, fill=fill, width=width)
+    r = width / 2
+    for x, y in (pts[0], pts[-1]):
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=fill)
+
+
+def _draw_arrow(draw: ImageDraw.ImageDraw, x1, y1, x2, y2, fill, width: int) -> None:
+    dx, dy = x2 - x1, y2 - y1
+    length = math.hypot(dx, dy)
+    if length < 1:
+        return
+    ang = math.atan2(dy, dx)
+    head = min(max(width * 3.4, 12 + width), length * 0.72)
+    wing = head * 0.58
+    inset = head * 0.55
+    sx = x2 - math.cos(ang) * inset
+    sy = y2 - math.sin(ang) * inset
+    _draw_line(draw, [(x1, y1), (sx, sy)], fill, width)
+    bx = x2 - math.cos(ang) * head
+    by = y2 - math.sin(ang) * head
+    px = math.cos(ang + math.pi / 2) * wing
+    py = math.sin(ang + math.pi / 2) * wing
+    draw.polygon([(x2, y2), (bx + px, by + py), (bx - px, by - py)], fill=fill)
+
+
+def draw_strokes(image: Image.Image, strokes: list[Stroke], scale: float) -> None:
+    draw = ImageDraw.Draw(image)
+    for stroke in strokes:
+        width = max(1, int(round(stroke.width * scale)))
+        fill = _fill(stroke.color)
+        if stroke.tool == "pen" and stroke.points:
+            pts = [(p[0] * scale, p[1] * scale) for p in stroke.points]
+            _draw_line(draw, pts, fill, width)
+        elif stroke.tool == "arrow" and stroke.box:
+            x1, y1, x2, y2 = stroke.box
+            _draw_arrow(draw, x1 * scale, y1 * scale, x2 * scale, y2 * scale, fill, width)
+        elif stroke.tool == "circle" and stroke.box:
+            x1, y1, x2, y2 = stroke.box
+            left, right = sorted((x1, x2))
+            top, bottom = sorted((y1, y2))
+            if right - left < 1 and bottom - top < 1:
+                continue
+            draw.ellipse(
+                (left * scale, top * scale, right * scale, bottom * scale),
+                outline=fill,
+                width=width,
+            )
+
+
+def pil_to_pixbuf(image: Image.Image):
+    rgba = image.convert("RGBA")
+    data = rgba.tobytes()
+    w, h = rgba.size
+    pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(
+        GLib.Bytes.new(data),
+        GdkPixbuf.Colorspace.RGB,
+        True,
+        8,
+        w,
+        h,
+        w * 4,
+    )
+    return pixbuf, data
+
+
+def fit_scale(img_w: int, img_h: int, max_w: int, max_h: int) -> float:
+    if img_w < 1 or img_h < 1:
+        return 1.0
+    fit = min(max_w / img_w, max_h / img_h)
+    if fit >= 1:
+        if max(img_w, img_h) < 480:
+            return min(2.0, fit)
+        return 1.0
+    return fit
+
+
+# --- X11 -----------------------------------------------------------------
+
+
+class XErrorEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+        ("resourceid", ctypes.c_ulong),
+    ]
+
+
+class XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
+class XSelEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("requestor", ctypes.c_ulong),
+        ("selection", ctypes.c_ulong),
+        ("target", ctypes.c_ulong),
+        ("property", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+    ]
+
+
+class XPropEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("atom", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("state", ctypes.c_int),
+    ]
+
+
+class XClientEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("data", ctypes.c_long * 5),
+    ]
+
+
+class XMapEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("request", ctypes.c_int),
+        ("first_keycode", ctypes.c_int),
+        ("count", ctypes.c_int),
+    ]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [
+        ("key", XKeyEvent),
+        ("sel", XSelEvent),
+        ("prop", XPropEvent),
+        ("client", XClientEvent),
+        ("mapping", XMapEvent),
+        ("pad", ctypes.c_char * 192),
+    ]
+
+
+x11 = ctypes.CDLL("libX11.so.6")
+xtst = ctypes.CDLL("libXtst.so.6")
+
+
+def _sig(fn, rest, args):
+    fn.restype = rest
+    fn.argtypes = args
+
+
+def _bind() -> None:
+    vp = ctypes.c_void_p
+    u64 = ctypes.c_ulong
+    i32 = ctypes.c_int
+    u32 = ctypes.c_uint
+    cp = ctypes.c_char_p
+    _sig(x11.XOpenDisplay, vp, [cp])
+    _sig(x11.XCloseDisplay, i32, [vp])
+    _sig(x11.XFlush, i32, [vp])
+    _sig(x11.XSync, i32, [vp, i32])
+    _sig(x11.XPending, i32, [vp])
+    _sig(x11.XNextEvent, i32, [vp, ctypes.POINTER(XEvent)])
+    _sig(x11.XConnectionNumber, i32, [vp])
+    _sig(x11.XDefaultRootWindow, u64, [vp])
+    _sig(x11.XCreateSimpleWindow, u64, [vp, u64, i32, i32, u32, u32, u32, u64, u64])
+    _sig(x11.XSelectInput, i32, [vp, u64, ctypes.c_long])
+    _sig(x11.XInternAtom, u64, [vp, cp, i32])
+    _sig(x11.XGetAtomName, vp, [vp, u64])
+    _sig(x11.XFree, i32, [vp])
+    _sig(x11.XConvertSelection, i32, [vp, u64, u64, u64, u64, u64])
+    _sig(
+        x11.XGetWindowProperty,
+        i32,
+        [
+            vp,
+            u64,
+            u64,
+            ctypes.c_long,
+            ctypes.c_long,
+            i32,
+            u64,
+            ctypes.POINTER(u64),
+            ctypes.POINTER(i32),
+            ctypes.POINTER(u64),
+            ctypes.POINTER(u64),
+            ctypes.POINTER(vp),
+        ],
+    )
+    _sig(x11.XDeleteProperty, i32, [vp, u64, u64])
+    _sig(x11.XSetErrorHandler, vp, [vp])
+    _sig(x11.XSetIOErrorHandler, vp, [vp])
+    _sig(x11.XGetErrorText, i32, [vp, i32, cp, i32])
+    _sig(x11.XKeysymToKeycode, ctypes.c_ubyte, [vp, u64])
+    _sig(x11.XGrabKey, i32, [vp, i32, u32, u64, i32, i32, i32])
+    _sig(x11.XUngrabKey, i32, [vp, i32, u32, u64])
+    _sig(x11.XAllowEvents, i32, [vp, i32, u64])
+    _sig(x11.XSendEvent, i32, [vp, u64, i32, ctypes.c_long, ctypes.POINTER(XEvent)])
+    _sig(x11.XSetInputFocus, i32, [vp, u64, i32, u64])
+    _sig(x11.XQueryKeymap, i32, [vp, ctypes.POINTER(ctypes.c_ubyte)])
+    _sig(x11.XRefreshKeyboardMapping, i32, [ctypes.POINTER(XMapEvent)])
+    _sig(x11.XGetSelectionOwner, u64, [vp, u64])
+    _sig(xtst.XTestQueryExtension, i32, [vp, ctypes.POINTER(i32), ctypes.POINTER(i32), ctypes.POINTER(i32), ctypes.POINTER(i32)])
+    _sig(xtst.XTestFakeKeyEvent, i32, [vp, u32, i32, u64])
+
+
+_bind()
+
+X_ERRORS: list[tuple[int, int, str]] = []
+
+
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+def _x_error(_dpy, event_p):
+    ev = ctypes.cast(event_p, ctypes.POINTER(XErrorEvent)).contents
+    buf = ctypes.create_string_buffer(256)
+    x11.XGetErrorText(_dpy, ev.error_code, buf, 255)
+    text = buf.value.decode("utf-8", "replace")
+    X_ERRORS.append((ev.error_code, ev.request_code, text))
+    log(f"X error {ev.error_code} req {ev.request_code}: {text}")
+    return 0
+
+
+@ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+def _x_io_error(_dpy):
+    log("X connection lost")
+    os._exit(1)
+
+
+class X11:
+    def __init__(self) -> None:
+        self.dpy = None
+        self.fd = -1
+        self.root = 0
+        self.win = 0
+        self.v_code = 0
+        self.ctrl_code = 0
+        self.atoms: dict[str, int] = {}
+        self.known: dict[int, str] = {}
+        self.inbox: list[XEvent] = []
+        self._closed = False
+
+    def open(self) -> None:
+        self.dpy = x11.XOpenDisplay(None)
+        if not self.dpy:
+            raise SystemExit("cannot open X display")
+        x11.XSetErrorHandler(_x_error)
+        x11.XSetIOErrorHandler(_x_io_error)
+        self.fd = x11.XConnectionNumber(self.dpy)
+        self.root = x11.XDefaultRootWindow(self.dpy)
+        self.win = x11.XCreateSimpleWindow(self.dpy, self.root, 0, 0, 1, 1, 0, 0, 0)
+        x11.XSelectInput(self.dpy, self.win, PropertyChangeMask)
+        ev = ctypes.c_int()
+        err = ctypes.c_int()
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
+        if not xtst.XTestQueryExtension(self.dpy, ctypes.byref(ev), ctypes.byref(err), ctypes.byref(major), ctypes.byref(minor)):
+            raise SystemExit("XTest extension is missing")
+        self.v_code = x11.XKeysymToKeycode(self.dpy, 0x0076)
+        self.ctrl_code = x11.XKeysymToKeycode(self.dpy, 0xFFE3)
+        if not self.v_code or not self.ctrl_code:
+            raise SystemExit("cannot resolve Ctrl or V keycode")
+        for name in (
+            "CLIPBOARD",
+            "TARGETS",
+            "INCR",
+            "UTF8_STRING",
+            "STRING",
+            "TEXT",
+            "COMPOUND_TEXT",
+            "text/plain",
+            "text/plain;charset=utf-8",
+            "_NET_ACTIVE_WINDOW",
+            "PA_PROP",
+            *IMAGE_MIMES,
+        ):
+            self._intern(name)
+        x11.XFlush(self.dpy)
+
+    def _intern(self, name: str) -> int:
+        if name in self.atoms:
+            return self.atoms[name]
+        atom = x11.XInternAtom(self.dpy, name.encode("utf-8"), False)
+        self.atoms[name] = atom
+        self.known[atom] = name
+        return atom
+
+    def atom_name(self, atom: int, deadline: float | None = None) -> str:
+        if atom in self.known:
+            return self.known[atom]
+        if deadline is not None and time.monotonic() > deadline:
+            return ""
+        ptr = x11.XGetAtomName(self.dpy, atom)
+        if not ptr:
+            self.known[atom] = ""
+            return ""
+        name = ctypes.cast(ptr, ctypes.c_char_p).value.decode("utf-8", "replace")
+        x11.XFree(ptr)
+        self.known[atom] = name
+        return name
+
+    def close(self) -> None:
+        if self._closed or not self.dpy:
+            return
+        self._closed = True
+        try:
+            self.ungrab()
+            x11.XFlush(self.dpy)
+            x11.XCloseDisplay(self.dpy)
+        except Exception:
+            pass
+        self.dpy = None
+
+    def grab_masks(self) -> list[int]:
+        masks = []
+        for bits in range(4):
+            extra = 0
+            if bits & 1:
+                extra |= LockMask
+            if bits & 2:
+                extra |= Mod2Mask
+            masks.append(ControlMask | extra)
+        return masks
+
+    def grab(self) -> None:
+        before = len(X_ERRORS)
+        ok = 0
+        for mask in self.grab_masks():
+            nerr = len(X_ERRORS)
+            x11.XGrabKey(self.dpy, self.v_code, mask, self.root, False, GrabModeAsync, GrabModeSync)
+            x11.XSync(self.dpy, False)
+            if len(X_ERRORS) == nerr:
+                ok += 1
+        if ok == 0:
+            detail = X_ERRORS[before:]
+            raise SystemExit(f"could not grab Ctrl+V ({detail})")
+        log(f"grabbed Ctrl+V keycode {self.v_code} ({ok} modifier masks)")
+
+    def ungrab(self) -> None:
+        if not self.dpy or not self.v_code:
+            return
+        x11.XUngrabKey(self.dpy, self.v_code, AnyModifier, self.root)
+        x11.XFlush(self.dpy)
+
+    def allow(self, mode: int) -> None:
+        x11.XAllowEvents(self.dpy, mode, CurrentTime)
+        x11.XFlush(self.dpy)
+
+    def suck(self) -> None:
+        while x11.XPending(self.dpy):
+            ev = XEvent()
+            x11.XNextEvent(self.dpy, ctypes.byref(ev))
+            self.inbox.append(ev)
+
+    def read_property(self, window: int, prop: int, delete: bool) -> tuple[int, int, bytes]:
+        actual_type = ctypes.c_ulong()
+        actual_fmt = ctypes.c_int()
+        nitems = ctypes.c_ulong()
+        after = ctypes.c_ulong()
+        ptr = ctypes.c_void_p()
+        x11.XGetWindowProperty(
+            self.dpy, window, prop, 0, 0, False, 0,
+            ctypes.byref(actual_type), ctypes.byref(actual_fmt),
+            ctypes.byref(nitems), ctypes.byref(after), ctypes.byref(ptr),
+        )
+        if ptr.value:
+            x11.XFree(ptr)
+        if after.value > MAX_CLIP_BYTES:
+            return 0, 0, b""
+        long_len = max(1, (after.value + 3) // 4)
+        actual_type = ctypes.c_ulong()
+        actual_fmt = ctypes.c_int()
+        nitems = ctypes.c_ulong()
+        after = ctypes.c_ulong()
+        ptr = ctypes.c_void_p()
+        x11.XGetWindowProperty(
+            self.dpy, window, prop, 0, long_len, bool(delete), 0,
+            ctypes.byref(actual_type), ctypes.byref(actual_fmt),
+            ctypes.byref(nitems), ctypes.byref(after), ctypes.byref(ptr),
+        )
+        fmt = actual_fmt.value
+        count = nitems.value
+        if fmt == 32:
+            nbytes = count * ctypes.sizeof(ctypes.c_ulong)
+        elif fmt == 16:
+            nbytes = count * 2
+        else:
+            nbytes = count
+        if nbytes > MAX_CLIP_BYTES:
+            if ptr.value:
+                x11.XFree(ptr)
+            return 0, 0, b""
+        data = ctypes.string_at(ptr, nbytes) if ptr.value and nbytes else b""
+        if ptr.value:
+            x11.XFree(ptr)
+        return actual_type.value, fmt, data
+
+    def active_window(self) -> int:
+        _typ, fmt, data = self.read_property(self.root, self.atoms["_NET_ACTIVE_WINDOW"], False)
+        if fmt != 32 or len(data) < ctypes.sizeof(ctypes.c_ulong):
+            return 0
+        return struct.unpack("@L", data[: ctypes.sizeof(ctypes.c_ulong)])[0]
+
+    def activate(self, window: int, timestamp: int) -> None:
+        if not window:
+            return
+        ev = XEvent()
+        client = ev.client
+        client.type = ClientMessage
+        client.display = self.dpy
+        client.window = window
+        client.message_type = self.atoms["_NET_ACTIVE_WINDOW"]
+        client.format = 32
+        client.data[0] = 1
+        client.data[1] = int(timestamp or 0)
+        client.data[2] = 0
+        client.data[3] = 0
+        client.data[4] = 0
+        mask = SubstructureNotifyMask | SubstructureRedirectMask
+        x11.XSendEvent(self.dpy, self.root, False, mask, ctypes.byref(ev))
+        x11.XFlush(self.dpy)
+
+    def key_down(self, keycode: int) -> bool:
+        buf = (ctypes.c_ubyte * 32)()
+        x11.XQueryKeymap(self.dpy, buf)
+        return bool(buf[keycode // 8] & (1 << (keycode % 8)))
+
+    def xtest(self, keycode: int, press: bool) -> None:
+        xtst.XTestFakeKeyEvent(self.dpy, keycode, 1 if press else 0, 0)
+
+    def send_paste(self) -> None:
+        """Type Ctrl+V. The V events come back through our grab and must be replayed."""
+        ctrl_down = self.key_down(self.ctrl_code)
+        v_down = self.key_down(self.v_code)
+        if v_down:
+            self.xtest(self.v_code, False)
+        if not ctrl_down:
+            self.xtest(self.ctrl_code, True)
+        self.xtest(self.v_code, True)
+        self.xtest(self.v_code, False)
+        if not ctrl_down:
+            self.xtest(self.ctrl_code, False)
+        x11.XFlush(self.dpy)
+
+    def refresh_mapping(self, ev: XEvent) -> None:
+        x11.XRefreshKeyboardMapping(ctypes.byref(ev.mapping))
+        self.v_code = x11.XKeysymToKeycode(self.dpy, 0x0076) or self.v_code
+        self.ctrl_code = x11.XKeysymToKeycode(self.dpy, 0xFFE3) or self.ctrl_code
+
+
+_X11_SINGLE: X11 | None = None
+
+
+def install_x11(x: X11) -> None:
+    global _X11_SINGLE
+    _X11_SINGLE = x
+    atexit.register(x.close)
+
+
+# --- editor --------------------------------------------------------------
+
+
+class Annotator:
+    def __init__(self, image: Image.Image, prefs: dict, on_paste, on_cancel, user_time: int = 0) -> None:
+        self.original = image.convert("RGBA")
+        self.prefs = prefs
+        self.on_paste_cb = on_paste
+        self.on_cancel_cb = on_cancel
+        self.user_time = int(user_time or 0)
+        self.strokes: list[Stroke] = []
+        self.active: Stroke | None = None
+        self.tool = prefs["tool"]
+        self.color_hex = prefs["color"]
+        self.color = hex_rgb(self.color_hex)
+        self.width = prefs["width"]
+        self._closed = False
+        self._render_queued = False
+        self._pointer_grabbed = False
+        ox, oy, mw, mh = self._monitor()
+        self.origin = (ox, oy, mw, mh)
+        max_w = max(320, mw - 80)
+        max_h = max(240, mh - 170)
+        self.scale = fit_scale(self.original.width, self.original.height, max_w, max_h)
+        pw = max(1, int(round(self.original.width * self.scale)))
+        ph = max(1, int(round(self.original.height * self.scale)))
+        if (pw, ph) != self.original.size:
+            self.preview_base = self.original.resize((pw, ph), Image.Resampling.LANCZOS)
+        else:
+            self.preview_base = self.original.copy()
+        self.preview_w, self.preview_h = self.preview_base.size
+        self.committed = self.preview_base.copy()
+        self._build()
+
+    def _monitor(self):
+        display = Gdk.Display.get_default()
+        try:
+            pos = display.get_default_seat().get_pointer().get_position()
+            x, y = int(pos[-2]), int(pos[-1])
+            mon = display.get_monitor_at_point(x, y)
+            geo = mon.get_geometry()
+            return geo.x, geo.y, geo.width, geo.height
+        except Exception:
+            return 0, 0, 1600, 900
+
+    def _build(self) -> None:
+        settings = Gtk.Settings.get_default()
+        if settings is not None:
+            settings.set_property("gtk-application-prefer-dark-theme", True)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+        self.win = Gtk.Window(title="Annotate paste")
+        self.win.set_icon_name("image-x-generic")
+        self.win.set_keep_above(True)
+        self.win.set_type_hint(Gdk.WindowTypeHint.NORMAL)
+        self.win.get_style_context().add_class("pa")
+        self.win.connect("delete-event", self._on_delete)
+        self.win.connect("key-press-event", self._on_key)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.win.add(outer)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.get_style_context().add_class("pa-bar")
+        outer.pack_start(bar, False, False, 0)
+
+        self.swatch_buttons = []
+        for index, (key, label, hx) in enumerate(SWATCHES):
+            btn = Gtk.Button()
+            btn.set_tooltip_text(f"{label} ({key})")
+            btn.set_can_focus(False)
+            ctx = btn.get_style_context()
+            ctx.add_class("swatch")
+            ctx.add_class(f"c{index}")
+            btn.connect("clicked", self._pick_swatch, hx)
+            bar.pack_start(btn, False, False, 0)
+            self.swatch_buttons.append((hx, btn))
+
+        self.color_btn = Gtk.ColorButton()
+        rgba = Gdk.RGBA()
+        rgba.parse(self.color_hex)
+        self.color_btn.set_rgba(rgba)
+        self.color_btn.set_title("Color")
+        self.color_btn.set_tooltip_text("Custom color")
+        self.color_btn.set_can_focus(False)
+        self.color_btn.set_size_request(28, 26)
+        self.color_btn.connect("color-set", self._pick_custom)
+        bar.pack_start(self.color_btn, False, False, 0)
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        width_label = Gtk.Label(label="Width")
+        bar.pack_start(width_label, False, False, 0)
+        self.scale_w = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 2, 36, 1)
+        self.scale_w.set_value(self.width)
+        self.scale_w.set_draw_value(False)
+        self.scale_w.set_size_request(120, -1)
+        self.scale_w.set_can_focus(False)
+        self.scale_w.set_tooltip_text("Line width. The mouse wheel and [ ] change it too.")
+        self.scale_w.connect("value-changed", self._width_changed)
+        bar.pack_start(self.scale_w, False, False, 0)
+        self.width_value = Gtk.Label(label=str(self.width))
+        self.width_value.set_width_chars(2)
+        bar.pack_start(self.width_value, False, False, 0)
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+
+        self.tool_buttons = {}
+        group = None
+        for tool, label, tip in (
+            ("pen", "Pen", "Freehand (P)"),
+            ("arrow", "Arrow", "Arrow (A)"),
+            ("circle", "Circle", "Circle (C). Hold Shift for a round circle."),
+        ):
+            if group is None:
+                btn = Gtk.RadioButton.new_with_label(None, label)
+                group = btn
+            else:
+                btn = Gtk.RadioButton.new_with_label_from_widget(group, label)
+            btn.set_mode(False)
+            btn.set_tooltip_text(tip)
+            btn.set_can_focus(False)
+            btn.get_style_context().add_class("tool")
+            if tool == self.tool:
+                btn.set_active(True)
+            btn.connect("toggled", self._tool_toggled, tool)
+            bar.pack_start(btn, False, False, 0)
+            self.tool_buttons[tool] = btn
+
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+        undo = Gtk.Button.new_with_label("Undo")
+        undo.set_tooltip_text("Undo (Ctrl+Z)")
+        undo.set_can_focus(False)
+        undo.connect("clicked", lambda *_: self.undo())
+        bar.pack_start(undo, False, False, 0)
+
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        bar.pack_start(spacer, True, True, 0)
+        cancel = Gtk.Button.new_with_label("Cancel")
+        cancel.set_tooltip_text("Don't paste (Esc)")
+        cancel.set_can_focus(False)
+        cancel.connect("clicked", lambda *_: self.cancel())
+        bar.pack_start(cancel, False, False, 0)
+        paste = Gtk.Button.new_with_label("Paste")
+        paste.set_tooltip_text("Paste into the previous window (Enter)")
+        paste.set_can_focus(False)
+        paste.get_style_context().add_class("suggested-action")
+        paste.connect("clicked", lambda *_: self.paste())
+        bar.pack_start(paste, False, False, 0)
+
+        self.img = Gtk.Image()
+        self.img.set_halign(Gtk.Align.START)
+        self.img.set_valign(Gtk.Align.START)
+        self.eb = Gtk.EventBox()
+        self.eb.set_halign(Gtk.Align.CENTER)
+        self.eb.set_valign(Gtk.Align.CENTER)
+        self.eb.add(self.img)
+        self.eb.set_can_focus(True)
+        self.eb.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+            | Gdk.EventMask.SMOOTH_SCROLL_MASK
+        )
+        self.eb.connect("button-press-event", self._press)
+        self.eb.connect("motion-notify-event", self._motion)
+        self.eb.connect("button-release-event", self._release)
+        self.eb.connect("scroll-event", self._scroll)
+        self.eb.connect("realize", self._crosshair)
+        outer.pack_start(self.eb, False, False, 8)
+
+        hint = Gtk.Label(
+            label="Drag to mark.   P pen   A arrow   C circle   1–7 color   [ ] width   Ctrl+Z undo   Enter pastes   Esc cancels"
+        )
+        hint.set_halign(Gtk.Align.START)
+        hint.get_style_context().add_class("pa-hint")
+        outer.pack_start(hint, False, False, 0)
+        self._mark_swatches()
+        self._show_image(self.committed)
+        self.win.show_all()
+        self._place()
+        self.eb.grab_focus()
+
+    def _place(self) -> None:
+        ox, oy, mw, mh = self.origin
+        self.win.show_all()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        w, h = self.win.get_size()
+        if w < 2 or h < 2:
+            nat = self.win.get_preferred_size()[1]
+            w, h = nat.width, nat.height
+        x = ox + max(0, (mw - w) // 2)
+        y = oy + max(0, (mh - h) // 2)
+        self.win.move(x, y)
+        if self.user_time:
+            self.win.present_with_time(self.user_time)
+        else:
+            self.win.present()
+        self.eb.grab_focus()
+
+    def _crosshair(self, widget) -> None:
+        cursor = Gdk.Cursor.new_for_display(widget.get_display(), Gdk.CursorType.CROSSHAIR)
+        widget.get_window().set_cursor(cursor)
+        self._cursor = cursor
+
+    def _mark_swatches(self) -> None:
+        current = self.color_hex.lower()
+        for hx, btn in self.swatch_buttons:
+            ctx = btn.get_style_context()
+            if hx.lower() == current:
+                ctx.add_class("selected")
+            else:
+                ctx.remove_class("selected")
+
+    def _remember(self) -> None:
+        self.prefs["color"] = self.color_hex
+        self.prefs["width"] = self.width
+        self.prefs["tool"] = self.tool
+        save_prefs(self.prefs)
+
+    def _pick_swatch(self, _btn, hx: str) -> None:
+        self.color_hex = hx
+        self.color = hex_rgb(hx)
+        rgba = Gdk.RGBA()
+        rgba.parse(hx)
+        self.color_btn.set_rgba(rgba)
+        self._mark_swatches()
+        self._remember()
+        self.eb.grab_focus()
+
+    def _pick_custom(self, btn) -> None:
+        rgba = btn.get_rgba()
+        self.color = (int(round(rgba.red * 255)), int(round(rgba.green * 255)), int(round(rgba.blue * 255)))
+        self.color_hex = f"#{self.color[0]:02x}{self.color[1]:02x}{self.color[2]:02x}"
+        self._mark_swatches()
+        self._remember()
+
+    def _width_changed(self, scale) -> None:
+        self.width = int(round(scale.get_value()))
+        self.width_value.set_text(str(self.width))
+        self._remember()
+
+    def _tool_toggled(self, btn, tool: str) -> None:
+        if btn.get_active():
+            self.tool = tool
+            self._remember()
+            self.eb.grab_focus()
+
+    def set_tool(self, tool: str) -> None:
+        self.tool = tool
+        button = self.tool_buttons.get(tool)
+        if button is not None:
+            button.set_active(True)
+        self._remember()
+
+    def set_width(self, width: int) -> None:
+        self.width = max(2, min(36, int(width)))
+        self.scale_w.set_value(self.width)
+        self._remember()
+
+    def _image_point(self, event, clamp: bool) -> tuple[float, float] | None:
+        alloc = self.img.get_allocation()
+        x = event.x - alloc.x
+        y = event.y - alloc.y
+        if clamp:
+            x = min(max(x, 0), self.preview_w - 1)
+            y = min(max(y, 0), self.preview_h - 1)
+        elif x < 0 or y < 0 or x >= self.preview_w or y >= self.preview_h:
+            return None
+        return x / self.scale, y / self.scale
+
+    def _press(self, _widget, event) -> bool:
+        if event.button == 3:
+            self.active = None
+            self._queue_render()
+            return True
+        if event.button != 1:
+            return False
+        pt = self._image_point(event, False)
+        if pt is None:
+            return True
+        self._grab_pointer(event)
+        image_width = max(1.0, self.width / self.scale)
+        if self.tool == "pen":
+            self.active = Stroke("pen", self.color, image_width, [pt])
+        else:
+            self.active = Stroke(self.tool, self.color, image_width, [], (pt[0], pt[1], pt[0], pt[1]))
+        self._queue_render()
+        return True
+
+    def _motion(self, _widget, event) -> bool:
+        if self.active is None or not (event.state & Gdk.ModifierType.BUTTON1_MASK):
+            return False
+        pt = self._image_point(event, True)
+        if pt is None:
+            return True
+        if self.active.tool == "pen":
+            last = self.active.points[-1]
+            if abs(last[0] - pt[0]) + abs(last[1] - pt[1]) >= 0.4:
+                self.active.points.append(pt)
+        else:
+            x1, y1, _x2, _y2 = self.active.box
+            x2, y2 = pt
+            if event.state & Gdk.ModifierType.SHIFT_MASK and self.active.tool == "circle":
+                side = max(abs(x2 - x1), abs(y2 - y1))
+                x2 = x1 + side * (1 if x2 >= x1 else -1)
+                y2 = y1 + side * (1 if y2 >= y1 else -1)
+            self.active.box = (x1, y1, x2, y2)
+        self._queue_render()
+        return True
+
+    def _release(self, _widget, event) -> bool:
+        self._ungrab_pointer()
+        if event.button != 1 or self.active is None:
+            return False
+        stroke = self.active
+        self.active = None
+        keep = False
+        if stroke.tool == "pen" and stroke.points:
+            keep = True
+        elif stroke.box:
+            x1, y1, x2, y2 = stroke.box
+            keep = abs(x2 - x1) + abs(y2 - y1) >= 3
+        if keep:
+            self.strokes.append(stroke)
+            self._rebuild_committed()
+        self._queue_render()
+        return True
+
+    def _scroll(self, _widget, event) -> bool:
+        direction = event.direction
+        delta = 0
+        if direction == Gdk.ScrollDirection.UP:
+            delta = 1
+        elif direction == Gdk.ScrollDirection.DOWN:
+            delta = -1
+        elif direction == Gdk.ScrollDirection.SMOOTH:
+            delta = -1 if event.delta_y > 0 else 1 if event.delta_y < 0 else 0
+        if delta:
+            self.set_width(self.width + delta)
+        return True
+
+    def _grab_pointer(self, event) -> None:
+        window = self.eb.get_window()
+        if window is None:
+            return
+        try:
+            seat = event.get_seat() if hasattr(event, "get_seat") else Gdk.Display.get_default().get_default_seat()
+            cursor = getattr(self, "_cursor", None)
+            status = seat.grab(window, Gdk.SeatCapabilities.POINTER, True, cursor, event, None)
+            self._pointer_grabbed = status == Gdk.GrabStatus.SUCCESS
+        except Exception:
+            self._pointer_grabbed = False
+
+    def _ungrab_pointer(self) -> None:
+        if not self._pointer_grabbed:
+            return
+        try:
+            Gdk.Display.get_default().get_default_seat().ungrab()
+        except Exception:
+            pass
+        self._pointer_grabbed = False
+
+    def _rebuild_committed(self) -> None:
+        self.committed = self.preview_base.copy()
+        draw_strokes(self.committed, self.strokes, self.scale)
+
+    def _frame(self) -> Image.Image:
+        frame = self.committed.copy()
+        if self.active is not None:
+            draw_strokes(frame, [self.active], self.scale)
+        return frame
+
+    def _queue_render(self) -> None:
+        if self._render_queued:
+            return
+        self._render_queued = True
+        GLib.timeout_add(16, self._render_now)
+
+    def _render_now(self) -> bool:
+        self._render_queued = False
+        if not self._closed:
+            self._show_image(self._frame())
+        return False
+
+    def _show_image(self, image: Image.Image) -> None:
+        pixbuf, data = pil_to_pixbuf(image)
+        self.img.set_from_pixbuf(pixbuf)
+        self._shown = (pixbuf, data)
+
+    def _on_key(self, _widget, event) -> bool:
+        key = event.keyval
+        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+        if key in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.paste()
+            return True
+        if key == Gdk.KEY_Escape:
+            if self.active is not None:
+                self.active = None
+                self._queue_render()
+            else:
+                self.cancel()
+            return True
+        if ctrl and key in (Gdk.KEY_z, Gdk.KEY_Z):
+            self.undo()
+            return True
+        if ctrl:
+            return False
+        name = Gdk.keyval_name(key) or ""
+        if name in ("p", "P"):
+            self.set_tool("pen")
+            return True
+        if name in ("a", "A"):
+            self.set_tool("arrow")
+            return True
+        if name in ("c", "C"):
+            self.set_tool("circle")
+            return True
+        for key_name, _label, hx in SWATCHES:
+            if name == key_name:
+                self._pick_swatch(None, hx)
+                return True
+        if name in ("bracketleft", "minus"):
+            self.set_width(self.width - 1)
+            return True
+        if name in ("bracketright", "equal", "plus"):
+            self.set_width(self.width + 1)
+            return True
+        return False
+
+    def undo(self) -> None:
+        if self.active is not None:
+            self.active = None
+        elif self.strokes:
+            self.strokes.pop()
+            self._rebuild_committed()
+        self._queue_render()
+
+    def paste(self) -> None:
+        if self._closed:
+            return
+        image = self.original.copy()
+        draw_strokes(image, self.strokes, 1.0)
+        self._shutdown()
+        self.on_paste_cb(image)
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        self._shutdown()
+        self.on_cancel_cb()
+
+    def _on_delete(self, *_args) -> bool:
+        self.cancel()
+        return True
+
+    def _shutdown(self) -> None:
+        self._closed = True
+        self._ungrab_pointer()
+        self.win.hide()
+        self.win.destroy()
+
+    def screenshot(self, path: str) -> bool:
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        gdk_win = self.win.get_window()
+        if gdk_win is None:
+            return False
+        w, h = self.win.get_size()
+        try:
+            pixbuf = Gdk.pixbuf_get_from_window(gdk_win, 0, 0, max(1, w), max(1, h))
+            pixbuf.savev(path, "png", [], [])
+            return True
+        except Exception as exc:
+            log(f"screenshot failed: {exc}")
+            return False
+
+
+# --- controller ----------------------------------------------------------
+
+
+class Controller:
+    def __init__(self, x: X11) -> None:
+        self.x = x
+        self.prefs = load_prefs()
+        self.ui: Annotator | None = None
+        self.opening = False
+        self.delivering = False
+        self.swallow_release = False
+        self._in_x = False
+        self._selecting = 0
+        self._clip_hold = None
+        self.saved_window = 0
+        self.saved_time = 0
+
+    def start(self) -> None:
+        GLib.io_add_watch(self.x.fd, GLib.IO_IN | GLib.IO_ERR | GLib.IO_HUP, self._on_x)
+        # XFlush can pull events into the Xlib queue without the fd staying
+        # readable, so the io watch never wakes. A short poll drains those.
+        GLib.timeout_add(15, self._backup_suck)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._quit)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, self._quit)
+
+    def _quit(self) -> bool:
+        self.x.ungrab()
+        Gtk.main_quit()
+        return False
+
+    def _backup_suck(self) -> bool:
+        if self._in_x or self._selecting:
+            return True
+        self._in_x = True
+        try:
+            self.x.suck()
+            self._dispatch()
+        finally:
+            self._in_x = False
+        return True
+
+    def _on_x(self, _fd, cond) -> bool:
+        if cond & (GLib.IO_ERR | GLib.IO_HUP):
+            log("X socket closed")
+            self._quit()
+            return False
+        if self._in_x or self._selecting:
+            self.x.suck()
+            return True
+        self._in_x = True
+        try:
+            self.x.suck()
+            self._dispatch()
+        finally:
+            self._in_x = False
+        return True
+
+    def _dispatch(self) -> None:
+        while self.x.inbox:
+            ev = self.x.inbox.pop(0)
+            try:
+                self._handle(ev)
+            except Exception:
+                log("event handler failed\n" + traceback.format_exc())
+                if ev.key.type in (KeyPress, KeyRelease):
+                    self.x.allow(ReplayKeyboard)
+
+    def _handle(self, ev: XEvent) -> None:
+        kind = ev.key.type
+        if kind == MappingNotify:
+            self.x.refresh_mapping(ev)
+            return
+        if kind not in (KeyPress, KeyRelease):
+            return
+        if ev.key.keycode != self.x.v_code:
+            self.x.allow(ReplayKeyboard)
+            return
+        if kind == KeyRelease:
+            mode = AsyncKeyboard if self.swallow_release else ReplayKeyboard
+            self.swallow_release = False
+            self.x.allow(mode)
+            return
+        state = int(ev.key.state)
+        plain = (state & ~STRIP_MODS) == ControlMask
+        if self.opening:
+            # The panel is still loading. Drop the repeat so the image is not
+            # pasted before the user can mark it.
+            self.swallow_release = True
+            self.x.allow(AsyncKeyboard)
+            return
+        if self.delivering or self.ui is not None or not plain:
+            # Replay, including the Ctrl+V we inject after the user hits Enter.
+            self.x.allow(ReplayKeyboard)
+            return
+        started = time.monotonic()
+        deadline = started + TARGETS_BUDGET_S
+        take = False
+        names: list[str] = []
+        active = 0
+        try:
+            names = self._target_names(deadline)
+            take = classify_names(names) == "image"
+            if take:
+                active = self.x.active_window()
+        except Exception:
+            log("clipboard check failed\n" + traceback.format_exc())
+            take = False
+        elapsed = time.monotonic() - started
+        if elapsed > 0.03:
+            log(f"clipboard check {elapsed * 1000:.0f}ms -> {'image' if take else 'pass'}")
+        if not take:
+            self.x.allow(ReplayKeyboard)
+            return
+        self.opening = True
+        self.swallow_release = True
+        self.saved_window = active
+        self.saved_time = int(ev.key.time)
+        self.x.allow(AsyncKeyboard)
+        mime = choose_mime(names)
+        log(f"image paste intercepted ({mime or 'image'})")
+        GLib.idle_add(self._open_editor, mime)
+
+    def _drop_selection_notifies(self) -> None:
+        self.x.suck()
+        self.x.inbox = [ev for ev in self.x.inbox if ev.key.type != SelectionNotify]
+
+    def _pump(self, deadline: float) -> None:
+        steps = 0
+        while Gtk.events_pending() and time.monotonic() < deadline and steps < 40:
+            Gtk.main_iteration_do(False)
+            steps += 1
+
+    def _wait(self, pred, deadline: float):
+        while time.monotonic() < deadline:
+            self.x.suck()
+            for index, ev in enumerate(self.x.inbox):
+                if pred(ev):
+                    return self.x.inbox.pop(index)
+            self._pump(deadline)
+            self.x.suck()
+            for index, ev in enumerate(self.x.inbox):
+                if pred(ev):
+                    return self.x.inbox.pop(index)
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+            select.select([self.x.fd], [], [], min(0.015, remain))
+        return None
+
+    def _selection_bytes(self, target_name: str, deadline: float) -> tuple[str, bytes] | None:
+        prop = self.x.atoms["PA_PROP"]
+        target = self.x._intern(target_name)
+        self._selecting += 1
+        try:
+            return self._selection_bytes_locked(target_name, target, prop, deadline)
+        finally:
+            self._selecting -= 1
+            if self._selecting == 0:
+                GLib.idle_add(self._dispatch_soon)
+
+    def _dispatch_soon(self) -> bool:
+        if self._in_x or self._selecting:
+            return False
+        self._in_x = True
+        try:
+            self.x.suck()
+            self._dispatch()
+        finally:
+            self._in_x = False
+        return False
+
+    def _selection_bytes_locked(self, target_name: str, target: int, prop: int, deadline: float) -> tuple[str, bytes] | None:
+        self._drop_selection_notifies()
+        x11.XDeleteProperty(self.x.dpy, self.x.win, prop)
+        x11.XConvertSelection(self.x.dpy, self.x.atoms["CLIPBOARD"], target, prop, self.x.win, CurrentTime)
+        x11.XFlush(self.x.dpy)
+
+        def is_sel(ev: XEvent) -> bool:
+            return ev.key.type == SelectionNotify and ev.sel.requestor == self.x.win and ev.sel.target == target
+
+        ev = self._wait(is_sel, deadline)
+        if ev is None or ev.sel.property == 0:
+            self._drop_selection_notifies()
+            return None
+        typ, _fmt, data = self.x.read_property(self.x.win, prop, True)
+        type_name = self.x.atom_name(typ) if typ else ""
+        if typ == self.x.atoms["INCR"]:
+            data = self._read_incr(prop, deadline)
+            if data is None:
+                return None
+            type_name = target_name
+        return type_name, data
+
+    def _read_incr(self, prop: int, deadline: float) -> bytes | None:
+        chunks: list[bytes] = []
+        total = 0
+        while time.monotonic() < deadline:
+            def is_new(ev: XEvent, prop=prop) -> bool:
+                return (
+                    ev.key.type == PropertyNotify
+                    and ev.prop.window == self.x.win
+                    and ev.prop.atom == prop
+                    and ev.prop.state == PropertyNewValue
+                )
+
+            ev = self._wait(is_new, deadline)
+            if ev is None:
+                return None
+            _typ, _fmt, chunk = self.x.read_property(self.x.win, prop, True)
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > MAX_CLIP_BYTES:
+                return None
+            chunks.append(chunk)
+        return None
+
+    def _target_names(self, deadline: float) -> list[str]:
+        got = self._selection_bytes("TARGETS", deadline)
+        if not got:
+            return []
+        type_name, data = got
+        if type_name != "ATOM":
+            return []
+        size = ctypes.sizeof(ctypes.c_ulong)
+        count = min(len(data) // size, 64)
+        if count <= 0:
+            return []
+        atoms = struct.unpack("@" + str(count) + "L", data[: count * size])
+        names = []
+        for atom in atoms:
+            name = self.x.atom_name(atom, deadline)
+            if name:
+                names.append(name)
+            if time.monotonic() > deadline and not names:
+                break
+        return names
+
+    def _open_editor(self, mime: str | None) -> bool:
+        try:
+            image = self._load_clipboard_image(mime)
+        except Exception:
+            log("image load failed\n" + traceback.format_exc())
+            image = None
+        if image is None:
+            self.opening = False
+            log("could not read clipboard image; pasting it unchanged")
+            self._deliver_keys_only()
+            return False
+        try:
+            self.ui = Annotator(image, self.prefs, self._pasted, self._cancelled, self.saved_time)
+        except Exception:
+            log("editor failed\n" + traceback.format_exc())
+            self.ui = None
+            self.opening = False
+            self._deliver_keys_only()
+            return False
+        self.opening = False
+        return False
+
+    def _load_clipboard_image(self, mime: str | None) -> Image.Image | None:
+        deadline = time.monotonic() + IMAGE_BUDGET_S
+        names = self._target_names(deadline)
+        mime = choose_mime(names) or mime
+        if not mime:
+            log(f"image reload found no image target in {names[:12]}")
+            return None
+        got = self._selection_bytes(mime, deadline)
+        if not got or not got[1]:
+            log(f"image reload got no bytes for {mime}")
+            return None
+        try:
+            image = Image.open(BytesIO(got[1]))
+            image = ImageOps.exif_transpose(image)
+            image.load()
+            return image.convert("RGBA")
+        except Exception as exc:
+            log(f"decode {mime} failed: {exc}")
+            return None
+
+    def _pasted(self, image: Image.Image) -> None:
+        # Block a new intercept while the marked image is put on the clipboard
+        # and Ctrl+V is injected. Clearing this later is what re-arms Ctrl+V.
+        self.delivering = True
+        self.ui = None
+        self.opening = False
+        pixbuf, data = pil_to_pixbuf(image)
+        self._set_clipboard(pixbuf, data)
+        self._deliver_current()
+
+    def _cancelled(self) -> None:
+        self.ui = None
+        self.opening = False
+        log("annotate cancelled")
+
+    def _set_clipboard(self, pixbuf, data) -> None:
+        clipboard = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        clipboard.set_image(pixbuf)
+        self._clip_hold = (pixbuf, data)
+        steps = 0
+        while Gtk.events_pending() and steps < 30:
+            Gtk.main_iteration_do(False)
+            steps += 1
+
+    def _deliver_keys_only(self) -> None:
+        self._deliver_current()
+
+    def _deliver_current(self) -> None:
+        self.delivering = True
+        target = self.saved_window
+        timestamp = self.saved_time
+
+        def attempt(tries: int) -> bool:
+            active = 0
+            try:
+                active = self.x.active_window()
+            except Exception:
+                active = 0
+            if target and active != target and tries < 12:
+                self.x.activate(target, timestamp)
+                if tries == 4:
+                    x11.XSetInputFocus(self.x.dpy, target, RevertToParent, CurrentTime)
+                    x11.XFlush(self.x.dpy)
+                GLib.timeout_add(25, lambda t=tries + 1: attempt(t))
+                return False
+            try:
+                self.x.send_paste()
+            except Exception:
+                log("paste key injection failed\n" + traceback.format_exc())
+            GLib.timeout_add(450, self._end_deliver)
+            return False
+
+        GLib.timeout_add(40, lambda: attempt(0))
+
+    def _end_deliver(self) -> bool:
+        self.delivering = False
+        return False
+
+
+def acquire_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(LOCK_PATH, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return None
+    fh.seek(0)
+    fh.truncate()
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
+def read_pid() -> int | None:
+    try:
+        return int(LOCK_PATH.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def pid_is_ours(pid: int) -> bool:
+    try:
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return b"paste-annotate" in cmd
+
+
+def stop_running() -> bool:
+    pid = read_pid()
+    if not pid or pid == os.getpid() or not pid_is_ours(pid):
+        return False
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(40):
+        if not pid_is_ours(pid):
+            return True
+        time.sleep(0.05)
+    os.kill(pid, signal.SIGKILL)
+    return True
+
+
+def run_daemon() -> int:
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" and not os.environ.get("DISPLAY"):
+        log("this session is Wayland without X11; not starting")
+        return 1
+    lock = acquire_lock()
+    if lock is None:
+        print("paste-annotate is already running", flush=True)
+        return 0
+    Gtk.init([])
+    x = X11()
+    x.open()
+    install_x11(x)
+    x.grab()
+    app = Controller(x)
+    app.start()
+    print("Paste Annotate is watching Ctrl+V. Text pastes go through. An image opens the marker.", flush=True)
+    log("ready")
+    if not sys.stdin.isatty():
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    Gtk.main()
+    return 0
+
+
+# --- self test -----------------------------------------------------------
+
+
+def _assert(cond, msg: str, failures: list[str]) -> None:
+    if not cond:
+        failures.append(msg)
+        print("FAIL", msg, flush=True)
+    else:
+        print("ok", msg, flush=True)
+
+
+def _test_draw(failures: list[str]) -> None:
+    image = Image.new("RGBA", (90, 90), (255, 255, 255, 255))
+    red = (255, 0, 0)
+    draw_strokes(
+        image,
+        [
+            Stroke("arrow", red, 6, [], (8, 45, 80, 45)),
+            Stroke("circle", (0, 80, 255), 4, [], (10, 8, 40, 38)),
+            Stroke("pen", (0, 160, 0), 5, [(12, 70), (40, 78), (70, 68)]),
+        ],
+        1,
+    )
+    path = "/tmp/paste-annotate-draw.png"
+    image.save(path)
+
+    def red_near(x, y) -> bool:
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                p = image.getpixel((x + dx, y + dy))
+                if p[0] > 200 and p[1] < 80 and p[2] < 80:
+                    return True
+        return False
+
+    _assert(red_near(80, 45), "arrow tip is red", failures)
+    _assert(red_near(40, 45), "arrow shaft is red", failures)
+    def blue_near(x, y) -> bool:
+        for dy in range(-4, 5):
+            for dx in range(-4, 5):
+                px, py = x + dx, y + dy
+                if not (0 <= px < 90 and 0 <= py < 90):
+                    continue
+                p = image.getpixel((px, py))
+                if p[2] > 150 and p[0] < 80:
+                    return True
+        return False
+
+    def green_near(x, y) -> bool:
+        for dy in range(-6, 7):
+            for dx in range(-6, 7):
+                px, py = x + dx, y + dy
+                if not (0 <= px < 90 and 0 <= py < 90):
+                    continue
+                p = image.getpixel((px, py))
+                if p[1] > 120 and p[0] < 90:
+                    return True
+        return False
+
+    center = image.getpixel((25, 23))
+    _assert(center[0] > 220 and center[1] > 220 and center[2] > 220, "circle center stays empty", failures)
+    _assert(blue_near(40, 23), "circle edge is blue", failures)
+    _assert(green_near(40, 76), "pen stroke is green", failures)
+
+
+def run_self_test() -> int:
+    os.environ["PASTE_ANNOTATE_DEBUG"] = "1"
+    failures: list[str] = []
+    _test_draw(failures)
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" and not os.environ.get("DISPLAY"):
+        print("no X display")
+        return 1
+    import subprocess
+
+    copyq = subprocess.run(["copyq", "disable"], check=False)
+    print("copyq disable", copyq.returncode, flush=True)
+    Gtk.init([])
+    x = X11()
+    holder = {"x": x}
+    result = {"code": 1}
+
+    def restore_and_close():
+        try:
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            if holder.get("snap_png"):
+                im = Image.open(BytesIO(holder["snap_png"]))
+                pb, _raw = pil_to_pixbuf(im)
+                cb.set_image(pb)
+            elif holder.get("snap_text") is not None:
+                cb.set_text(holder["snap_text"], -1)
+            for _ in range(8):
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+        except Exception as exc:
+            log(f"clipboard restore failed: {exc}")
+        xx = holder["x"]
+        if xx is not None:
+            try:
+                xx.ungrab()
+                xx.close()
+            except Exception:
+                pass
+            holder["x"] = None
+        subprocess.run(["copyq", "enable"], check=False)
+
+    try:
+        x.open()
+        ctrl = Controller(x)
+        deadline = time.monotonic() + 1.0
+        names = ctrl._target_names(deadline)
+        snap_text = None
+        snap_png = None
+        if classify_names(names) == "image":
+            mime = choose_mime(names)
+            if mime:
+                got = ctrl._selection_bytes(mime, time.monotonic() + 1.5)
+                if got:
+                    snap_png = got[1]
+        else:
+            for candidate in ("UTF8_STRING", "text/plain"):
+                if any(n.lower() == candidate.lower() for n in names):
+                    got = ctrl._selection_bytes(candidate, time.monotonic() + 0.8)
+                    if got and got[1]:
+                        snap_text = got[1].decode("utf-8", "replace")
+                        break
+        print("snapshot", "png" if snap_png else "text" if snap_text is not None else "empty", "targets", len(names), flush=True)
+        holder["snap_text"] = snap_text
+        holder["snap_png"] = snap_png
+
+        x.grab()
+        app = ctrl
+        app.start()
+
+        text_win = Gtk.Window(title="paste-annotate self-test")
+        text_view = Gtk.TextView()
+        text_buf = text_view.get_buffer()
+        text_win.add(text_view)
+        text_win.set_default_size(420, 80)
+        keys = {"n": 0}
+
+        def on_key(_w, event):
+            if event.keyval in (Gdk.KEY_v, Gdk.KEY_V) and event.state & Gdk.ModifierType.CONTROL_MASK:
+                keys["n"] += 1
+            return False
+
+        text_win.connect("key-press-event", on_key)
+        text_win.show_all()
+
+        state = {"step": "focus"}
+
+        def buffer_text():
+            return text_buf.get_text(text_buf.get_start_iter(), text_buf.get_end_iter(), True)
+
+        def window_xid(widget) -> int:
+            gdk_win = widget.get_window()
+            return int(gdk_win.get_xid()) if gdk_win is not None else 0
+
+        def focus_widget(widget) -> bool:
+            widget.present()
+            if hasattr(widget, "grab_focus"):
+                widget.grab_focus()
+            xid = window_xid(widget if isinstance(widget, Gtk.Window) else text_win)
+            active = x.active_window()
+            if xid and active != xid:
+                x.activate(xid, 0)
+                x11.XSetInputFocus(x.dpy, xid, RevertToParent, CurrentTime)
+                x11.XFlush(x.dpy)
+            return bool(xid) and x.active_window() == xid
+
+        def when(pred, then, limit=1.2):
+            started = time.monotonic()
+
+            def tick():
+                if pred() or time.monotonic() - started > limit:
+                    then()
+                    return False
+                return True
+
+            GLib.timeout_add(30, tick)
+
+        def when_text_focused(then):
+            state["step"] = "focus-text"
+
+            def ready():
+                text_view.grab_focus()
+                return focus_widget(text_win)
+
+            def go():
+                if x.active_window() != window_xid(text_win):
+                    failures.append("test window did not take focus")
+                    print("FAIL focus", x.active_window(), window_xid(text_win), flush=True)
+                    step_restore()
+                    return
+                then()
+
+            when(ready, go, 1.5)
+
+        def set_text(value: str):
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(value, -1)
+            for _ in range(10):
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+
+        def set_solid(color, w, h):
+            image = Image.new("RGBA", (w, h), color)
+            pixbuf, data = pil_to_pixbuf(image)
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_image(pixbuf)
+            app._clip_hold = (pixbuf, data)
+            for _ in range(15):
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+
+        def step_text():
+            state["step"] = "text"
+            set_text("PA_SELFTEST_TEXT")
+            text_buf.set_text("")
+            keys["n"] = 0
+
+            def go():
+                x.send_paste()
+                when(lambda: buffer_text() == "PA_SELFTEST_TEXT" and keys["n"] >= 1, step_text_check, 1.2)
+
+            when_text_focused(go)
+
+        def step_text_check():
+            got = buffer_text()
+            _assert(got == "PA_SELFTEST_TEXT", f"text paste replayed once ({got!r})", failures)
+            _assert(keys["n"] >= 1, "text window received Ctrl+V", failures)
+            if failures:
+                step_restore()
+                return
+            text_buf.set_text("")
+            keys["n"] = 0
+            x.send_paste()
+            when(lambda: buffer_text() == "PA_SELFTEST_TEXT", step_text_second, 1.2)
+
+        def step_text_second():
+            got = buffer_text()
+            _assert(got == "PA_SELFTEST_TEXT", f"second text paste still works ({got!r})", failures)
+            if failures:
+                step_restore()
+                return
+            state["step"] = "image"
+            text_buf.set_text("KEEP")
+            keys["n"] = 0
+            set_solid((20, 40, 200, 255), 420, 260)
+            x.send_paste()
+            when(lambda: app.ui is not None and not app.ui._closed, step_image_check, 1.5)
+
+        def step_image_check():
+            ui = app.ui
+            _assert(ui is not None and not ui._closed, "image Ctrl+V opened the panel", failures)
+            _assert(buffer_text() == "KEEP", "original image was not pasted through", failures)
+            _assert(keys["n"] == 0, "intercepted Ctrl+V did not reach the text window", failures)
+            if ui is None or ui._closed:
+                step_restore()
+                return
+            ui.screenshot("/tmp/paste-annotate-ui.png")
+            ui.strokes.append(Stroke("arrow", (255, 0, 0), 8, [], (30, 40, 300, 200)))
+            ui._rebuild_committed()
+            ui._show_image(ui._frame())
+            while Gtk.events_pending():
+                Gtk.main_iteration_do(False)
+            ui.screenshot("/tmp/paste-annotate-marked.png")
+            ui.win.present()
+
+            def send_escape():
+                xid = window_xid(ui.win)
+                if x.active_window() != xid:
+                    x.activate(xid, 0)
+                    x11.XSetInputFocus(x.dpy, xid, RevertToParent, CurrentTime)
+                    x11.XFlush(x.dpy)
+                if x.active_window() != xid:
+                    print("FAIL panel focus", "active", x.active_window(), "panel", xid, flush=True)
+                    failures.append("panel did not take focus for Esc")
+                    ui.cancel()
+                    step_escape()
+                    return
+                code = x11.XKeysymToKeycode(x.dpy, 0xFF1B)
+                xtst.XTestFakeKeyEvent(x.dpy, code, True, 0)
+                xtst.XTestFakeKeyEvent(x.dpy, code, False, 0)
+                x11.XFlush(x.dpy)
+                when(lambda: app.ui is None or app.ui._closed, step_escape, 1.0)
+
+            when(lambda: x.active_window() == window_xid(ui.win), send_escape, 1.0)
+
+        def step_escape():
+            ui = app.ui
+            closed = ui is None or ui._closed
+            _assert(closed, "Esc closed the panel", failures)
+            _assert(buffer_text() == "KEEP", "Esc did not paste", failures)
+            if ui is not None and not ui._closed:
+                ui.cancel()
+            if failures:
+                step_restore()
+                return
+            set_text("PA_SELFTEST_AFTER")
+            text_buf.set_text("")
+
+            def go():
+                x.send_paste()
+                when(lambda: buffer_text() == "PA_SELFTEST_AFTER", step_after_check, 1.2)
+
+            when_text_focused(go)
+
+        def step_after_check():
+            _assert(buffer_text() == "PA_SELFTEST_AFTER", f"text paste works after cancel ({buffer_text()!r})", failures)
+            if failures:
+                step_restore()
+                return
+
+            def go():
+                app.saved_window = window_xid(text_win)
+                app.saved_time = 0
+                marked = Image.new("RGBA", (80, 40), (0, 0, 0, 255))
+                draw_strokes(marked, [Stroke("arrow", (255, 0, 0), 4, [], (5, 20, 70, 20))], 1)
+                pixbuf, data = pil_to_pixbuf(marked)
+                app._set_clipboard(pixbuf, data)
+                keys["n"] = 0
+                app._deliver_current()
+                when(lambda: keys["n"] >= 1, step_deliver, 1.5)
+
+            when_text_focused(go)
+
+        def step_deliver():
+            _assert(keys["n"] >= 1, "annotated paste injected Ctrl+V", failures)
+            got = ctrl._selection_bytes("image/png", time.monotonic() + 1.0)
+            ok_png = bool(got and got[1][:8] == b"\x89PNG\r\n\x1a\n")
+            _assert(ok_png, "clipboard holds a PNG after paste", failures)
+            if got and got[1]:
+                try:
+                    im = Image.open(BytesIO(got[1])).convert("RGBA")
+                    tip = im.getpixel((min(70, im.width - 1), min(20, im.height - 1)))
+                    _assert(tip[0] > 180, f"pasted PNG has the arrow ({tip})", failures)
+                except Exception as exc:
+                    failures.append(f"pasted PNG decode: {exc}")
+            step_restore()
+
+        def step_restore():
+            if app.ui is not None and not app.ui._closed:
+                app.ui.cancel()
+            cb = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            if snap_png:
+                try:
+                    im = Image.open(BytesIO(snap_png))
+                    pb, raw = pil_to_pixbuf(im)
+                    cb.set_image(pb)
+                    app._clip_hold = (pb, raw)
+                except Exception as exc:
+                    log(f"restore image failed: {exc}")
+            elif snap_text is not None:
+                cb.set_text(snap_text, -1)
+            for _ in range(10):
+                while Gtk.events_pending():
+                    Gtk.main_iteration_do(False)
+            text_win.destroy()
+            result["code"] = 0 if not failures else 1
+            Gtk.main_quit()
+
+        def bail():
+            failures.append(f"timed out during {state['step']}")
+            print("FAIL timeout", state["step"], flush=True)
+            result["code"] = 1
+            try:
+                step_restore()
+            except Exception:
+                Gtk.main_quit()
+            return False
+
+        GLib.timeout_add(20000, bail)
+        GLib.idle_add(lambda: step_text() or False)
+        Gtk.main()
+    except Exception:
+        traceback.print_exc()
+        failures.append("self-test crashed")
+        result["code"] = 1
+    finally:
+        restore_and_close()
+    if failures:
+        print(f"{len(failures)} failure(s)", flush=True)
+        return 1
+    print("SELF-TEST PASSED", flush=True)
+    return result["code"]
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Draw on an image clipboard before Ctrl+V pastes it.")
+    parser.add_argument("--stop", action="store_true", help="stop the running helper")
+    parser.add_argument("--status", action="store_true", help="print whether it is running")
+    parser.add_argument("--replace", action="store_true", help="restart if one is already running")
+    parser.add_argument("--self-test", action="store_true", help="run the grab, paste, and drawing checks")
+    args = parser.parse_args(argv)
+    if args.self_test:
+        return run_self_test()
+    if args.status:
+        pid = read_pid()
+        if pid and pid_is_ours(pid):
+            print(f"running (pid {pid})")
+            return 0
+        print("not running")
+        return 1
+    if args.stop:
+        if stop_running():
+            print("stopped")
+            return 0
+        print("not running")
+        return 0
+    if args.replace:
+        stop_running()
+        time.sleep(0.15)
+    return run_daemon()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        raise SystemExit(0)
